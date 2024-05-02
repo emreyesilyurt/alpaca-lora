@@ -2,9 +2,13 @@ import os
 import sys
 import fire
 import torch
-from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer
+import warnings  # Import the warnings module
+from transformers import LlamaForCausalLM, LlamaTokenizer, GenerationConfig
 from peft import PeftModel
 from utils.prompter import Prompter
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -17,7 +21,6 @@ try:
 except:  # noqa: E722
     pass
 
-
 def generate_text(
     instruction,
     input_text=None,
@@ -25,14 +28,7 @@ def generate_text(
     base_model="huggyllama/llama-7b",
     lora_weights="tloen/alpaca-lora-7b",
     prompt_template="",
-    temperature=0.1,
-    top_p=0.75,
-    top_k=40,
-    num_beams=4,
-    max_new_tokens=128,
     stream_output=False,
-    server_name="0.0.0.0",
-    share_gradio=False,
 ):
     base_model = base_model or os.environ.get("BASE_MODEL", "")
     assert (
@@ -75,13 +71,13 @@ def generate_text(
             device_map={"": device},
         )
 
-    # unwind broken decapoda-research config
+    # Unwind broken decapoda-research config
     model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
     model.config.bos_token_id = 1
     model.config.eos_token_id = 2
 
     if not load_8bit:
-        model.half()  # seems to fix bugs for some users.
+        model.half()  # Seems to fix bugs for some users.
 
     model.eval()
 
@@ -89,72 +85,48 @@ def generate_text(
         prompt = prompter.generate_prompt(instruction, input_text)
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(device)
-        generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams,
-            **kwargs,
-        )
+        generation_config = GenerationConfig(**kwargs)
 
         generate_params = {
             "input_ids": input_ids,
             "generation_config": generation_config,
             "return_dict_in_generate": True,
             "output_scores": True,
-            "max_new_tokens": max_new_tokens,
         }
 
         if stream_output:
-            # Stream the reply 1 token at a time.
-            # This is based on the trick of using 'stopping_criteria' to create an iterator,
-            # from https://github.com/oobabooga/text-generation-webui/blob/ad37f396fc8bcbab90e11ecf17c56c97bfbd4a9c/modules/text_generation.py#L216-L243.
-
-            def generate_with_callback(callback=None, **kwargs):
-                kwargs.setdefault(
-                    "stopping_criteria", transformers.StoppingCriteriaList()
-                )
-                kwargs["stopping_criteria"].append(
-                    Stream(callback_func=callback)
-                )
-                with torch.no_grad():
-                    model.generate(**kwargs)
-
-            def generate_with_streaming(**kwargs):
-                return Iteratorize(
-                    generate_with_callback, kwargs, callback=None
-                )
-
-            with generate_with_streaming(**generate_params) as generator:
-                for output in generator:
+            with torch.no_grad():
+                for output in model.generate(**generate_params):
                     decoded_output = tokenizer.decode(output)
 
                     if output[-1] in [tokenizer.eos_token_id]:
                         break
 
                     yield prompter.get_response(decoded_output)
-            return  # early return for stream_output
+            return
 
-        # Without streaming
         with torch.no_grad():
             generation_output = model.generate(
                 input_ids=input_ids,
                 generation_config=generation_config,
                 return_dict_in_generate=True,
                 output_scores=True,
-                max_new_tokens=max_new_tokens,
             )
         s = generation_output.sequences[0]
         output = tokenizer.decode(s)
         yield prompter.get_response(output)
 
-    # Call the evaluate function with provided arguments
-    response_generator = evaluate()
+    response_generator = evaluate(max_new_tokens=128)  # Set max_new_tokens here
 
-    # Print the generated response
     for response in response_generator:
         print(response)
 
+# if __name__ == "__main__":
+#     fire.Fire(generate_text)
+
 
 if __name__ == "__main__":
-    fire.Fire(generate_text)
+    while True:
+        instruction = input("Please enter your instruction: ")
+        input_text = input("Please enter your input text (optional): ")
+        generate_text(instruction, input_text)
